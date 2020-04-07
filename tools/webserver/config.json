@@ -3,4 +3,5 @@
 	"bind-port": 8080,
 	"map-dir": "/tmp/tilemaps",
 	"file-dir": "/tmp/files"
+	"log-file": "/tmp/access.log"
 }

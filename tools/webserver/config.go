@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"os"
 )
@@ -16,6 +18,7 @@ type Config struct {
 	BindPort uint   `json:"bind-port"`
 	FileDir  string `json:"file-dir"`
 	MapDir   string `json:"map-dir"`
+	LogFile  string `json:"log-file"`
 }
 
 func LoadConfig(pth string) (c Config, err error) {
@@ -66,4 +69,25 @@ func (c *Config) validate() (err error) {
 // validate should have been called when the config is loaded
 func (c *Config) BindString() string {
 	return fmt.Sprintf("%s:%d", c.BindAddr, c.BindPort)
+}
+
+func (c *Config) LogWriter() (wtr io.WriteCloser, err error) {
+	if c.LogFile == `` {
+		wtr = &discarder{Writer: ioutil.Discard}
+	} else {
+		var f *os.File
+		if f, err = os.OpenFile(c.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); err != nil {
+			return
+		}
+		wtr = f
+	}
+	return
+}
+
+type discarder struct {
+	io.Writer
+}
+
+func (d *discarder) Close() error {
+	return nil
 }
