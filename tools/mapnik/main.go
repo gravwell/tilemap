@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	tilemap "../.."
+	"github.com/gravwell/tilemap"
 
 	"github.com/fawick/go-mapnik/mapnik"
 )

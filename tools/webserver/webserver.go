@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	tilemap "../.."
 	"github.com/gorilla/mux"
+	"github.com/gravwell/tilemap/v1"
 )
 
 const (

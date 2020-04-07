@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"strings"
 
-	tilemap "../.."
-	"github.com/gravwell/ingesters/utils"
+	"github.com/gravwell/ingesters/v3/utils"
+	"github.com/gravwell/tilemap"
 )
 
 const (
