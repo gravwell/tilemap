@@ -1,0 +1,6 @@
+{
+	"bind-addr": "0.0.0.0",
+	"bind-port": 8080,
+	"map-dir": "/tmp/tilemaps",
+	"file-dir": "/tmp/files"
+}
