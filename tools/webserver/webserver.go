@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/gravwell/tilemap/v1"
+	"github.com/gravwell/tilemap"
 )
 
 const (
@@ -29,7 +30,9 @@ type Webserver struct {
 	sync.WaitGroup
 	lst  net.Listener
 	tm   []*tilemap.Tilemap
-	lwtr io.WriteCloser
+	accW io.WriteCloser
+	lgrW io.WriteCloser
+	lgr  *log.Logger
 }
 
 func NewWebserver(c Config, maps []*tilemap.Tilemap) (w *Webserver, err error) {
@@ -47,15 +50,20 @@ func NewWebserver(c Config, maps []*tilemap.Tilemap) (w *Webserver, err error) {
 			ReadTimeout:  time.Second,
 		},
 	}
-	if w.lwtr, err = c.LogWriter(); err != nil {
+	if w.accW, err = c.AccessLogWriter(); err != nil {
 		return
 	}
+	if w.lgrW, err = c.LogWriter(); err != nil {
+		return
+	}
+	w.lgr = log.New(w.lgrW, ``, log.LUTC|log.Lshortfile|log.LstdFlags)
 	rtr := mux.NewRouter()
 	rtr.HandleFunc(`/tiles/{zoom:\d+}/{x:\d+}/{y:\d+}.png`, w.tileHandler).Methods(`GET`)
 	if c.FileDir != `` {
 		rtr.NotFoundHandler = fhandler{http.FileServer(http.Dir(filepath.Clean(c.FileDir)))}
 	}
-	w.Server.Handler = loggingHandler(w.lwtr, rtr)
+	w.Server.Handler = loggingHandler(w.accW, rtr)
+	w.Server.ErrorLog = w.lgr
 
 	return
 }
@@ -67,8 +75,8 @@ func (ws *Webserver) tileHandler(w http.ResponseWriter, r *http.Request) {
 	} else if zoom < 0 || zoom >= len(ws.tm) || ws.tm[zoom] == nil {
 		w.WriteHeader(http.StatusNotFound)
 	} else if tbuff, err := ws.tm[zoom].GetTile(x, y); err != nil {
-		fmt.Println("Get Tile", zoom, x, y, err)
 		w.WriteHeader(http.StatusInternalServerError)
+		ws.lgr.Printf("ERROR GetTile %d/%d/%d - %v\n", zoom, x, y, err)
 	} else {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write(tbuff)
@@ -127,13 +135,12 @@ func (w *Webserver) run() {
 }
 
 func (w *Webserver) Close() (err error) {
-	err = w.lst.Close()
-	w.Wait()
-	if err == nil {
-		err = w.lwtr.Close()
-	} else {
-		w.lwtr.Close()
+	if err = w.lst.Close(); err != nil {
+		w.lgr.Printf("ERROR Failed to close listener: %v\n", err)
 	}
+	w.Wait()
+	w.accW.Close()
+	w.lgrW.Close()
 	return
 }
 

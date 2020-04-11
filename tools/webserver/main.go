@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gravwell/ingesters/v3/utils"
-	"github.com/gravwell/tilemap/v1"
+	"github.com/gravwell/ingesters/utils"
+	"github.com/gravwell/tilemap"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 	}
 
 	//load up our tile maps
-	tmm, err := loadTilemaps(cfg.MapDir)
+	tmm, err := loadTilemaps(cfg.TilesDir)
 	if err != nil {
 		log.Fatalf("Failed to gather tilemaps: %v\n", err)
 	}

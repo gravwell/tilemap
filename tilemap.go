@@ -70,7 +70,6 @@ func NewTilemap(pth string, zoom int, ro bool) (w *Tilemap, err error) {
 	var mm gommap.MMap
 	tc := tileCount(zoom)
 	dpRegionSize := int64(tc * dpsize)
-	fmt.Printf("%d %d tiles %d dpsize %d mmap\n", zoom, tc, dpsize, dpRegionSize)
 	if fio, err = os.OpenFile(pth, oflags, 0640); err != nil {
 		return
 	}
@@ -92,7 +91,6 @@ func NewTilemap(pth string, zoom int, ro bool) (w *Tilemap, err error) {
 	if mm, err = gommap.MapRegion(fio.Fd(), 0, dpRegionSize, mapflags, gommap.MAP_SHARED); err != nil {
 		fio.Close()
 	}
-	fmt.Println("Mapped", len(mm))
 	var foff int64
 	if foff, err = fio.Seek(0, os.SEEK_END); err != nil {
 		mm.UnsafeUnmap()
@@ -213,7 +211,8 @@ func (w *Tilemap) GetTile(x, y int) (buff []byte, err error) {
 	buffStart := dp.offset
 	buffEnd := dp.offset + dp.size
 	if buffStart < int64(len(w.mm)) || buffEnd > w.foff {
-		err = errorLine(ErrInvalidDatapointer)
+		err = errorLine(fmt.Errorf("%v %x:%x %x:%x %v",
+			buffStart, buffEnd, len(w.mm), w.foff, ErrInvalidDatapointer))
 	} else {
 		buff = make([]byte, dp.size)
 		if _, err = w.fio.ReadAt(buff, dp.offset); err != nil {

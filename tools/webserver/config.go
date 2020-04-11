@@ -7,18 +7,27 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"strconv"
 )
 
 const (
 	TilesExtension string = `.tiles`
+
+	envBindAddr      string = `BIND_ADDRESS`
+	envBindPort      string = `BIND_PORT`
+	envFileDir       string = `FILE_DIR`
+	envTilesDir      string = `TILES_DIR`
+	envLogFile       string = `LOG_FILE`
+	envAccessLogFile string = `ACCESS_LOG_FILE`
 )
 
 type Config struct {
-	BindAddr string `json:"bind-addr"`
-	BindPort uint   `json:"bind-port"`
-	FileDir  string `json:"file-dir"`
-	MapDir   string `json:"map-dir"`
-	LogFile  string `json:"log-file"`
+	BindAddr      string `json:"bind-addr"`
+	BindPort      uint16 `json:"bind-port"`
+	FileDir       string `json:"file-dir"`
+	TilesDir      string `json:"tiles-dir"`
+	AccessLogFile string `json:"access-log-file"`
+	LogFile       string `json:"log-file"`
 }
 
 func LoadConfig(pth string) (c Config, err error) {
@@ -35,6 +44,15 @@ func LoadConfig(pth string) (c Config, err error) {
 }
 
 func (c *Config) validate() (err error) {
+	//load up any environment variables
+	loadEnvString(&c.BindAddr, envBindAddr)
+	loadEnvString(&c.FileDir, envFileDir)
+	loadEnvString(&c.TilesDir, envTilesDir)
+	loadEnvString(&c.LogFile, envLogFile)
+	loadEnvString(&c.AccessLogFile, envAccessLogFile)
+	loadEnvUint16(&c.BindPort, envBindPort)
+
+	//check some sanity
 	if c.BindAddr == `` {
 		c.BindAddr = `0.0.0.0` //set to default bind all
 	} else if net.ParseIP(c.BindAddr) == nil {
@@ -47,10 +65,10 @@ func (c *Config) validate() (err error) {
 	}
 
 	var fi os.FileInfo
-	if fi, err = os.Stat(c.MapDir); err != nil {
+	if fi, err = os.Stat(c.TilesDir); err != nil {
 		return
 	} else if fi.Mode().IsDir() == false {
-		err = fmt.Errorf("map file path %s is not a directory", c.MapDir)
+		err = fmt.Errorf("map file path %s is not a directory", c.TilesDir)
 		return
 	}
 
@@ -72,11 +90,19 @@ func (c *Config) BindString() string {
 }
 
 func (c *Config) LogWriter() (wtr io.WriteCloser, err error) {
-	if c.LogFile == `` {
+	return c.logWriter(c.LogFile)
+}
+
+func (c *Config) AccessLogWriter() (wtr io.WriteCloser, err error) {
+	return c.logWriter(c.AccessLogFile)
+}
+
+func (c *Config) logWriter(v string) (wtr io.WriteCloser, err error) {
+	if v == `` {
 		wtr = &discarder{Writer: ioutil.Discard}
 	} else {
 		var f *os.File
-		if f, err = os.OpenFile(c.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); err != nil {
+		if f, err = os.OpenFile(v, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); err != nil {
 			return
 		}
 		wtr = f
@@ -90,4 +116,22 @@ type discarder struct {
 
 func (d *discarder) Close() error {
 	return nil
+}
+
+func loadEnvString(v *string, key string) {
+	if v == nil || *v != `` {
+		return
+	} else if x, ok := os.LookupEnv(key); ok {
+		*v = x
+	}
+}
+
+func loadEnvUint16(v *uint16, key string) {
+	if v == nil || *v != 0 {
+		return
+	} else if x, ok := os.LookupEnv(key); ok {
+		if val, err := strconv.Atoi(x); err == nil && val >= 0 && val <= 0xffff {
+			*v = uint16(val)
+		}
+	}
 }

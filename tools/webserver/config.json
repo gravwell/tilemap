@@ -1,7 +1,8 @@
 {
 	"bind-addr": "0.0.0.0",
 	"bind-port": 8080,
-	"map-dir": "/tmp/tilemaps",
-	"file-dir": "/tmp/files"
-	"log-file": "/tmp/access.log"
+	"tiles-dir": "/tmp/tilemaps",
+	"file-dir": "/tmp/files",
+	"access-log-file": "/tmp/access.log",
+	"log-file": "/tmp/error.log"
 }

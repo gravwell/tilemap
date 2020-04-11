@@ -10,9 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gravwell/tilemap"
-
 	"github.com/fawick/go-mapnik/mapnik"
+	"github.com/gravwell/tilemap"
 )
 
 var (

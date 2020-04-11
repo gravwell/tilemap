@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gravwell/ingesters/v3/utils"
+	"github.com/gravwell/ingesters/utils"
 	"github.com/gravwell/tilemap"
 )
 
@@ -23,7 +23,7 @@ const (
 )
 
 var (
-	maxZoom                 = flag.Int("max-zoom", 10, "Maximum level of zoom, must be < 20")
+	maxZoom                 = flag.Int("max-zoom", 15, "Maximum level of zoom, must be < 20")
 	ErrInvalidFileExtension = errors.New("Invalid png file extension")
 
 	baseDir string
