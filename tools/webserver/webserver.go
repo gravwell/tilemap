@@ -75,10 +75,16 @@ func (ws *Webserver) tileHandler(w http.ResponseWriter, r *http.Request) {
 	} else if zoom < 0 || zoom >= len(ws.tm) || ws.tm[zoom] == nil {
 		w.WriteHeader(http.StatusNotFound)
 	} else if tbuff, err := ws.tm[zoom].GetTile(x, y); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		ws.lgr.Printf("ERROR GetTile %d/%d/%d - %v\n", zoom, x, y, err)
+		if errors.Is(err, tilemap.ErrTileNotFound) || errors.Is(err, tilemap.ErrInvalidTileID) {
+			w.WriteHeader(http.StatusNotFound)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			ws.lgr.Printf("ERROR GetTile %d/%d/%d - %v\n", zoom, x, y, err)
+		}
 	} else {
-		w.Header().Set("Content-Type", "image/png")
+		h := w.Header()
+		h.Set("Content-Type", "image/png")
+		h.Set("Content-Length", strconv.Itoa(len(tbuff)))
 		w.Write(tbuff)
 	}
 }

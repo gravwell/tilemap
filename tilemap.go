@@ -1,24 +1,46 @@
+// Package tilemap implements a compact on-disk store for a single zoom level
+// of map tiles.
+//
+// A tilemap file is laid out as a fixed size index region followed by a
+// densely packed data region:
+//
+//	[ datapointer * 4^zoom ][ tile bytes ... ]
+//
+// Each datapointer is 10 bytes: a 48 bit absolute file offset and a 32 bit
+// size.  The index region is memory mapped so that looking up a tile is a
+// single bounds check and a 10 byte decode.  Identical tiles (think ocean) are
+// stored once and referenced by every tile that shares the bytes.
 package tilemap
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"sync"
 
 	"github.com/dchest/siphash"
-	"github.com/tysontate/gommap"
+	"github.com/tysonmote/gommap"
 )
 
 const (
-	dpsize         = 6 + 4 //48bit offset, 4 byte size
-	maxDimension   = 16
-	maxMapInitSize = 1024 * 1024 * 16 //start at 16mil
-	maxTileSize    = 1 << 24          // like 4MB whichi si stupid
+	dpsize       = 6 + 4 // 48bit offset, 4 byte size
+	maxDimension = 16
 
+	// writeBufferSize is the size of the append buffer used in read/write
+	// mode.  Tiles are typically a few KB so this coalesces hundreds of
+	// tiles into a single write syscall.
+	writeBufferSize = 1024 * 1024
+
+	// MaxZoom is the largest zoom level a tilemap can hold.
 	MaxZoom = maxDimension
+
+	// MaxTileSize is the largest single tile that can be stored.
+	MaxTileSize = 1 << 24
 
 	wtrMapFlags  = gommap.PROT_WRITE | gommap.PROT_READ
 	wtrOpenFlags = os.O_RDWR | os.O_CREATE
@@ -27,144 +49,198 @@ const (
 )
 
 var (
-	ErrInvalidBufferSize   = errors.New("Invalid buffer size")
-	ErrInvalidDimension    = errors.New("Invalid tile zoom")
+	ErrInvalidBufferSize   = errors.New("invalid buffer size")
+	ErrInvalidDimension    = errors.New("invalid tile zoom")
 	ErrInvalidTileID       = errors.New("invalid tile id")
 	ErrInvalidTileBuffer   = errors.New("invalid tile buffer")
 	ErrInvalidDatapointer  = errors.New("invalid tile datapointer, file may be corrupt")
 	ErrInvalidDPRegionSize = errors.New("invalid tile datapointer region size, file may be corrupt")
-	ErrPartialWrite        = errors.New("Partial write")
+	ErrPartialWrite        = errors.New("partial write")
+	ErrReadOnly            = errors.New("tilemap is read only")
+	ErrClosed              = errors.New("tilemap is closed")
+	ErrTileNotFound        = errors.New("tile not found")
+	ErrInvalidPath         = errors.New("invalid path")
 )
 
+// Tilemap is a single zoom level tile store.  It is safe for concurrent use.
 type Tilemap struct {
-	sync.RWMutex
+	mtx  sync.RWMutex
 	ro   bool
 	zoom int
+	dim  int // tiles per side, 1<<zoom
 	hmp  map[uint64]uint32
 	fio  *os.File
-	mm   gommap.MMap
-	foff int64
+	mm   gommap.MMap // datapointer index region (always mapped)
+	data gommap.MMap // whole file mapping, read only mode only
+	wtr  *bufio.Writer
+	cmp  []byte // scratch buffer for dedup verification
+	foff int64  // logical end of file, including buffered but unflushed bytes
+	open bool
 }
 
+// NewTilemap opens (or in read/write mode creates) the tilemap at pth for the
+// given zoom level.  When ro is true the file is opened read only and the
+// Add method returns ErrReadOnly.
 func NewTilemap(pth string, zoom int, ro bool) (w *Tilemap, err error) {
 	if zoom < 0 || zoom > maxDimension {
-		err = ErrInvalidDimension
-		return
+		return nil, ErrInvalidDimension
 	} else if pth == `` {
-		err = errors.New("invalid path")
-		return
+		return nil, ErrInvalidPath
 	}
-	var oflags int
-	var mapflags gommap.ProtFlags
-
+	oflags, mapflags := wtrOpenFlags, gommap.ProtFlags(wtrMapFlags)
 	if ro {
-		oflags = rdrOpenFlags
-		mapflags = rdrMapFlags
-	} else {
-		oflags = wtrOpenFlags
-		mapflags = wtrMapFlags
-
+		oflags, mapflags = rdrOpenFlags, rdrMapFlags
 	}
 
-	var fio *os.File
-	var mm gommap.MMap
-	tc := tileCount(zoom)
-	dpRegionSize := int64(tc * dpsize)
-	if fio, err = os.OpenFile(pth, oflags, 0640); err != nil {
-		return
+	fio, err := os.OpenFile(pth, oflags, 0640)
+	if err != nil {
+		return nil, err
 	}
-	//best effort, may not be supported
-	setAttr(fio, NO_COW)
-
-	// if not in readonly mode, prep the file
-	if !ro {
-		if _, err = prepFileMap(fio, zoom); err != nil {
+	// everything below here must close fio on failure
+	defer func() {
+		if err != nil {
 			fio.Close()
-			return
 		}
+	}()
+
+	dpRegionSize := int64(tileCount(zoom)) * dpsize
+	var fsize int64
+	if ro {
+		fsize, err = checkFileMap(fio, zoom)
 	} else {
-		if _, err = checkFileMap(fio, zoom); err != nil {
-			fio.Close()
-			return
-		}
+		// best effort, may not be supported by the filesystem
+		setNoCOW(fio)
+		fsize, err = prepFileMap(fio, zoom)
 	}
-	if mm, err = gommap.MapRegion(fio.Fd(), 0, dpRegionSize, mapflags, gommap.MAP_SHARED); err != nil {
-		fio.Close()
+	if err != nil {
+		return nil, err
+	} else if fsize < dpRegionSize {
+		return nil, ErrInvalidDPRegionSize
 	}
-	var foff int64
-	if foff, err = fio.Seek(0, os.SEEK_END); err != nil {
-		mm.UnsafeUnmap()
-		fio.Close()
-		return
-	} else if foff < dpRegionSize {
-		mm.UnsafeUnmap()
-		fio.Close()
-		err = ErrInvalidDPRegionSize
-		return
+
+	mm, err := gommap.MapRegion(fio.Fd(), 0, dpRegionSize, mapflags, gommap.MAP_SHARED)
+	if err != nil {
+		return nil, errorLine(err)
 	}
 	w = &Tilemap{
 		ro:   ro,
 		zoom: zoom,
+		dim:  1 << uint(zoom),
 		fio:  fio,
 		mm:   mm,
-		foff: foff,
+		foff: fsize,
+		open: true,
 	}
-	return
-}
-
-func (w *Tilemap) initHashMap() {
-	mapInitSize := tileCount(w.zoom)
-	if mapInitSize > maxMapInitSize {
-		mapInitSize = maxMapInitSize
-	}
-	w.hmp = make(map[uint64]uint32, mapInitSize)
-}
-
-func (w *Tilemap) Add(x, y int, buff []byte) (err error) {
-	w.Lock()
-	defer w.Unlock()
-	var dp datapointer
-	bsize := len(buff)
-	mid := 1 << uint(w.zoom)
-	tid := w.tileid(x, y)
-	if x < 0 || x >= mid || y < 0 || y >= mid {
-		err = fmt.Errorf("%v %d %d", errorLine(ErrInvalidTileID), x, y)
-		return
-	} else if bsize == 0 || bsize > maxTileSize {
-		err = errorLine(ErrInvalidTileBuffer)
-		return
-	}
-	if w.hmp == nil {
-		//we are going to be writing, so go ahead and init the hash map
-		w.initHashMap()
-	}
-	//hash the buffer and check if we know about it
-	key := siphash.Hash(sipkey1, sipkey2, buff)
-	if extid, ok := w.hmp[key]; ok {
-		if dp, err = w.getDataPointer(extid); err != nil {
-			err = errorLine(err)
-			return
+	if ro {
+		// map the entire file so reads are a bounds check and a copy
+		if w.data, err = gommap.MapRegion(fio.Fd(), 0, fsize, rdrMapFlags, gommap.MAP_SHARED); err != nil {
+			mm.UnsafeUnmap()
+			return nil, errorLine(err)
 		}
 	} else {
-		//no hash collision, write it out
-		if dp, err = w.writeNewBuffer(buff); err != nil {
-			err = errorLine(err)
-			return
+		// all appends go through a buffered writer positioned at the end
+		if _, err = fio.Seek(fsize, io.SeekStart); err != nil {
+			mm.UnsafeUnmap()
+			return nil, errorLine(err)
 		}
-		w.hmp[key] = tid //add to our collision map
+		w.wtr = bufio.NewWriterSize(fio, writeBufferSize)
+		w.hmp = make(map[uint64]uint32, 1024)
+	}
+	return w, nil
+}
+
+// Zoom returns the zoom level held by the tilemap.
+func (w *Tilemap) Zoom() int {
+	return w.zoom
+}
+
+// Size returns the current logical size of the tilemap file in bytes.
+func (w *Tilemap) Size() int64 {
+	w.mtx.RLock()
+	defer w.mtx.RUnlock()
+	return w.foff
+}
+
+// Add stores buff as the tile at x, y.  If an identical tile has already been
+// added through this handle the bytes are shared rather than written again.
+func (w *Tilemap) Add(x, y int, buff []byte) (err error) {
+	if w.ro {
+		return ErrReadOnly
+	} else if x < 0 || x >= w.dim || y < 0 || y >= w.dim {
+		return fmt.Errorf("%w %d/%d", ErrInvalidTileID, x, y)
+	} else if len(buff) == 0 || len(buff) > MaxTileSize {
+		return fmt.Errorf("%w (%d bytes)", ErrInvalidTileBuffer, len(buff))
+	}
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if !w.open {
+		return ErrClosed
+	}
+	tid := w.tileid(x, y)
+	key := siphash.Hash(sipkey1, sipkey2, buff)
+	if extid, ok := w.hmp[key]; ok {
+		// potential duplicate, verify the bytes actually match before
+		// aliasing the tile so a hash collision can never serve the wrong tile
+		var dp datapointer
+		var same bool
+		if dp, err = w.getDataPointer(extid); err != nil {
+			return errorLine(err)
+		} else if same, err = w.sameContents(dp, buff); err != nil {
+			return errorLine(err)
+		} else if same {
+			return w.setDataPointer(tid, dp)
+		}
+	}
+	dp, err := w.writeNewBuffer(buff)
+	if err != nil {
+		return errorLine(err)
+	}
+	if _, ok := w.hmp[key]; !ok {
+		w.hmp[key] = tid
 	}
 	if err = w.setDataPointer(tid, dp); err != nil {
-		err = fmt.Errorf("Failed to set datapointer for %d/%d: %v", x, y, err)
+		err = fmt.Errorf("failed to set datapointer for %d/%d: %w", x, y, err)
 	}
 	return
+}
+
+// sameContents reports whether the stored tile at dp holds exactly buff.
+// The caller must hold the write lock.
+func (w *Tilemap) sameContents(dp datapointer, buff []byte) (bool, error) {
+	if dp.size != int64(len(buff)) {
+		return false, nil
+	} else if err := w.flushFor(dp); err != nil {
+		return false, err
+	}
+	if cap(w.cmp) < len(buff) {
+		w.cmp = make([]byte, len(buff))
+	}
+	cmp := w.cmp[:len(buff)]
+	if _, err := w.fio.ReadAt(cmp, dp.offset); err != nil {
+		return false, err
+	}
+	return bytes.Equal(cmp, buff), nil
+}
+
+// flushFor makes sure the bytes referenced by dp are on disk rather than
+// sitting in the append buffer.  The caller must hold the write lock.
+func (w *Tilemap) flushFor(dp datapointer) error {
+	if w.wtr == nil || w.wtr.Buffered() == 0 {
+		return nil
+	}
+	flushed := w.foff - int64(w.wtr.Buffered())
+	if dp.offset+dp.size <= flushed {
+		return nil
+	}
+	return w.wtr.Flush()
 }
 
 func (w *Tilemap) writeNewBuffer(buff []byte) (dp datapointer, err error) {
 	var n int
-	if n, err = w.fio.Write(buff); err != nil {
+	if n, err = w.wtr.Write(buff); err != nil {
 		return
 	} else if n != len(buff) {
-		err = errorLine(ErrPartialWrite)
+		err = ErrPartialWrite
 		return
 	}
 	dp.offset = w.foff
@@ -175,63 +251,151 @@ func (w *Tilemap) writeNewBuffer(buff []byte) (dp datapointer, err error) {
 
 func (w *Tilemap) getDataPointer(tid uint32) (dp datapointer, err error) {
 	toff := int64(tid) * dpsize
-	if (toff + 6) > int64(len(w.mm)) {
-		err = errorLine(ErrInvalidTileID)
-		err = fmt.Errorf("%v %d > %d", err, (toff + 6), len(w.mm))
+	if toff+dpsize > int64(len(w.mm)) {
+		err = fmt.Errorf("%w %d: %d > %d", ErrInvalidTileID, tid, toff+dpsize, len(w.mm))
 	} else {
-		if err = dp.Decode(w.mm[toff:]); err != nil {
-			err = errorLine(err)
-		}
+		err = dp.Decode(w.mm[toff : toff+dpsize])
 	}
 	return
 }
 
 func (w *Tilemap) setDataPointer(tid uint32, dp datapointer) (err error) {
 	toff := int64(tid) * dpsize
-	if (toff + 6) > int64(len(w.mm)) {
-		err = fmt.Errorf("%v %d %d > %d", errorLine(ErrInvalidTileID), tid, (toff + 6), len(w.mm))
+	if toff+dpsize > int64(len(w.mm)) {
+		err = fmt.Errorf("%w %d: %d > %d", ErrInvalidTileID, tid, toff+dpsize, len(w.mm))
 	} else {
-		if err = dp.Encode(w.mm[toff:]); err != nil {
-			err = errorLine(err)
-		}
+		err = dp.Encode(w.mm[toff : toff+dpsize])
 	}
 	return
 }
 
+// lookup validates x, y and returns the datapointer for the tile.  It returns
+// ErrTileNotFound for a tile that has never been added.  The caller must hold
+// at least the read lock.
+func (w *Tilemap) lookup(x, y int) (dp datapointer, err error) {
+	if !w.open {
+		return dp, ErrClosed
+	} else if x < 0 || x >= w.dim || y < 0 || y >= w.dim {
+		return dp, fmt.Errorf("%w %d/%d", ErrInvalidTileID, x, y)
+	}
+	if dp, err = w.getDataPointer(w.tileid(x, y)); err != nil {
+		return
+	} else if dp.size == 0 {
+		return dp, ErrTileNotFound
+	}
+	// the data region starts after the index, and must end within the file
+	if dp.offset < int64(len(w.mm)) || dp.offset+dp.size > w.foff {
+		err = fmt.Errorf("%w %x:%x not within %x:%x", ErrInvalidDatapointer,
+			dp.offset, dp.offset+dp.size, len(w.mm), w.foff)
+	}
+	return
+}
+
+// Has reports whether a tile has been stored at x, y.
+func (w *Tilemap) Has(x, y int) (bool, error) {
+	w.mtx.RLock()
+	defer w.mtx.RUnlock()
+	if _, err := w.lookup(x, y); err != nil {
+		if errors.Is(err, ErrTileNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// GetTile returns a copy of the tile stored at x, y.  ErrTileNotFound is
+// returned for a tile that was never added.
 func (w *Tilemap) GetTile(x, y int) (buff []byte, err error) {
-	var dp datapointer
-	w.RLock()
-	defer w.RUnlock()
-	tid := w.tileid(x, y)
-	if dp, err = w.getDataPointer(tid); err != nil {
-		err = errorLine(err)
+	if w.ro {
+		w.mtx.RLock()
+		defer w.mtx.RUnlock()
+		var dp datapointer
+		if dp, err = w.lookup(x, y); err != nil {
+			return nil, err
+		}
+		buff = make([]byte, dp.size)
+		copy(buff, w.data[dp.offset:dp.offset+dp.size])
 		return
 	}
-	//check that the bounds of the buffer are valid
-	buffStart := dp.offset
-	buffEnd := dp.offset + dp.size
-	if buffStart < int64(len(w.mm)) || buffEnd > w.foff {
-		err = errorLine(fmt.Errorf("%v %x:%x %x:%x %v",
-			buffStart, buffEnd, len(w.mm), w.foff, ErrInvalidDatapointer))
-	} else {
-		buff = make([]byte, dp.size)
-		if _, err = w.fio.ReadAt(buff, dp.offset); err != nil {
-			buff = nil
-			err = errorLine(err)
-		}
+	// read/write mode may need to flush the append buffer, so take the
+	// exclusive lock
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	var dp datapointer
+	if dp, err = w.lookup(x, y); err != nil {
+		return nil, err
+	} else if err = w.flushFor(dp); err != nil {
+		return nil, errorLine(err)
+	}
+	buff = make([]byte, dp.size)
+	if _, err = w.fio.ReadAt(buff, dp.offset); err != nil {
+		return nil, errorLine(err)
 	}
 	return
 }
 
+// Flush pushes any buffered tile data out to the operating system.
+func (w *Tilemap) Flush() error {
+	if w.ro {
+		return nil
+	}
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if !w.open {
+		return ErrClosed
+	}
+	return w.wtr.Flush()
+}
+
+// Sync flushes buffered tile data and forces both the index and the data to
+// stable storage.
+func (w *Tilemap) Sync() error {
+	if w.ro {
+		return nil
+	}
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if !w.open {
+		return ErrClosed
+	}
+	if err := w.wtr.Flush(); err != nil {
+		return errorLine(err)
+	} else if err = w.mm.Sync(gommap.MS_SYNC); err != nil {
+		return errorLine(err)
+	}
+	return w.fio.Sync()
+}
+
+// Close flushes outstanding writes and releases the file and mappings.
+// Closing an already closed tilemap is a no-op.
 func (w *Tilemap) Close() (err error) {
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if !w.open {
+		return nil
+	}
+	w.open = false
 	w.hmp = nil
-	if err = w.mm.UnsafeUnmap(); err != nil {
-		w.fio.Close()
-		err = errorLine(err)
-	} else {
-		if err = w.fio.Close(); err != nil {
+	w.cmp = nil
+	if w.wtr != nil {
+		if err = w.wtr.Flush(); err != nil {
 			err = errorLine(err)
 		}
+		w.wtr = nil
+	}
+	if w.data != nil {
+		if lerr := w.data.UnsafeUnmap(); lerr != nil && err == nil {
+			err = errorLine(lerr)
+		}
+		w.data = nil
+	}
+	if lerr := w.mm.UnsafeUnmap(); lerr != nil && err == nil {
+		err = errorLine(lerr)
+	}
+	w.mm = nil
+	if lerr := w.fio.Close(); lerr != nil && err == nil {
+		err = errorLine(lerr)
 	}
 	return
 }
@@ -240,48 +404,43 @@ func (w *Tilemap) tileid(x, y int) uint32 {
 	return tileid(w.zoom, x, y)
 }
 
+// tileid maps an x, y pair to its index slot.  Tiles are stored x major so a
+// column of tiles is contiguous in the index.
 func tileid(zoom, x, y int) uint32 {
-	dim := int(1 << uint(zoom))
-	if dim == 1 {
-		return 0 //zoom of zero only has one tile, this is a special case
-	}
-	return uint32(x*dim + y)
+	return uint32(x)<<uint(zoom) | uint32(y)
 }
 
-func prepFileMap(fio *os.File, d int) (r int64, err error) {
+func prepFileMap(fio *os.File, zoom int) (r int64, err error) {
 	var fi os.FileInfo
-	tc := tileCount(d)
-	sz := int64(dpsize * tc)
+	sz := int64(tileCount(zoom)) * dpsize
 	if fi, err = fio.Stat(); err != nil {
 		err = errorLine(err)
 		return
 	}
-	if fi.Size() < sz {
-		if err = safeFallocate(fio, fi.Size(), sz); err == nil {
-			r = sz
+	if r = fi.Size(); r < sz {
+		if err = safeFallocate(fio, r, sz); err != nil {
+			return
 		}
-	} else {
-		r = fi.Size()
+		r = sz
 	}
 	return
 }
 
-func checkFileMap(fio *os.File, d int) (r int64, err error) {
+func checkFileMap(fio *os.File, zoom int) (r int64, err error) {
 	var fi os.FileInfo
-	tc := tileCount(d)
-	sz := int64(dpsize * tc)
+	sz := int64(tileCount(zoom)) * dpsize
 	if fi, err = fio.Stat(); err != nil {
 		return
 	}
-	if fi.Size() < sz {
-		err = errors.New("File map is undersized")
+	if r = fi.Size(); r < sz {
+		err = ErrInvalidDPRegionSize
 	}
 	return
 }
 
+// tileCount returns the number of tiles in a zoom level.
 func tileCount(zoom int) int64 {
-	x := int64(1 << int64(zoom))
-	return x * x
+	return int64(1) << (2 * uint(zoom))
 }
 
 type datapointer struct {
@@ -289,31 +448,29 @@ type datapointer struct {
 	size   int64
 }
 
-// Decode pulls the 10bit encoded databpointer out of a byte slice
-// encoding is [48 bits] [32bits]
+// Decode pulls the 10 byte encoded datapointer out of a byte slice.
+// Encoding is [48 bit little endian offset][32 bit little endian size].
 func (dp *datapointer) Decode(b []byte) (err error) {
 	if len(b) < dpsize {
-		err = ErrInvalidBufferSize
-	} else {
-		dp.offset = int64(binary.LittleEndian.Uint16(b))
-		dp.offset |= (int64(binary.LittleEndian.Uint32(b[2:])) << 16)
-		dp.size = int64(binary.LittleEndian.Uint32(b[6:]))
+		return ErrInvalidBufferSize
 	}
+	dp.offset = int64(binary.LittleEndian.Uint16(b)) | int64(binary.LittleEndian.Uint32(b[2:]))<<16
+	dp.size = int64(binary.LittleEndian.Uint32(b[6:]))
 	return
 }
 
+// Encode writes the datapointer into b using the layout described in Decode.
 func (dp *datapointer) Encode(b []byte) (err error) {
 	if len(b) < dpsize {
-		err = ErrInvalidBufferSize
-	} else {
-		binary.LittleEndian.PutUint16(b, uint16(dp.offset))
-		binary.LittleEndian.PutUint32(b[2:], uint32(dp.offset>>16))
-		binary.LittleEndian.PutUint32(b[6:], uint32(dp.size))
+		return ErrInvalidBufferSize
 	}
+	binary.LittleEndian.PutUint16(b, uint16(dp.offset))
+	binary.LittleEndian.PutUint32(b[2:], uint32(dp.offset>>16))
+	binary.LittleEndian.PutUint32(b[6:], uint32(dp.size))
 	return
 }
 
 func errorLine(err error) error {
 	_, fname, line, _ := runtime.Caller(1)
-	return fmt.Errorf("%s:%d %v", fname, line, err)
+	return fmt.Errorf("%s:%d %w", fname, line, err)
 }

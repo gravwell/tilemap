@@ -13,3 +13,9 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# tool binaries built in place
+tools/httpClient/httpClient
+tools/webserver/webserver
+tools/tarImport/tarImport
+tools/mapnik/mapnik
