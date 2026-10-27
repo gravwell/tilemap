@@ -19,9 +19,6 @@ import (
 const (
 	retryBase = 500 * time.Millisecond
 	retryMax  = 15 * time.Second
-
-	// checkTimeout bounds the preflight request, independent of -timeout
-	checkTimeout = time.Second
 )
 
 var (
@@ -131,12 +128,13 @@ func (f *fetcher) newBuffer() *bytes.Buffer {
 
 // check performs a single request for the first tile to make sure the
 // endpoint is reachable and shaped the way we expect before doing any work.
-// It is deliberately strict: one attempt, a short deadline, no retries, and a
-// 404 is a failure even when -allow-missing is set.  The long timeout and
-// the retry loop only apply to the real run.
-func (f *fetcher) check(ctx context.Context) error {
+// It is deliberately strict: one attempt, no retries, and a 404 is a failure
+// even when -allow-missing is set.  The deadline must leave room for an
+// on-demand renderer to draw an uncached tile.  The retry loop only applies
+// to the real run.
+func (f *fetcher) check(ctx context.Context, timeout time.Duration) error {
 	var st stats
-	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	_, err := f.doRequest(ctx, f.newBuffer(), f.ep.url(0, 0), &st)
 	switch {
@@ -145,7 +143,7 @@ func (f *fetcher) check(ctx context.Context) error {
 	case errors.Is(err, errNotFound):
 		return fmt.Errorf("%s: 404 Not Found, check the endpoint path", f.ep.url(0, 0))
 	case errors.Is(err, context.DeadlineExceeded):
-		return fmt.Errorf("no response within %v", checkTimeout)
+		return fmt.Errorf("no response within %v, raise -check-timeout for slow renderers", timeout)
 	}
 	return err
 }

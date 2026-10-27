@@ -42,13 +42,11 @@ func NewWebserver(c Config, maps []*tilemap.Tilemap) (w *Webserver, err error) {
 	}
 
 	w = &Webserver{
-		Config: c,
-		lst:    lst,
-		tm:     maps,
-		Server: http.Server{
-			WriteTimeout: 5 * time.Second, //these are tiny files, so this is even kind of nuts
-			ReadTimeout:  time.Second,
-		},
+		Config:       c,
+		lst:          lst,
+		tm:           maps,
+		WriteTimeout: 5 * time.Second, //these are tiny files, so this is even kind of nuts
+		ReadTimeout:  time.Second,
 	}
 	if w.accW, err = c.AccessLogWriter(); err != nil {
 		return

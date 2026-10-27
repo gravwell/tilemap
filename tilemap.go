@@ -73,6 +73,11 @@ type Tilemap struct {
 	mm   gommap.MMap // datapointer index region (always mapped)
 	data gommap.MMap // whole file mapping, read only mode only
 	wtr  *bufio.Writer
+	// pend holds index entries whose tile bytes may still be sitting in wtr.
+	// They are only written to the mapped index once the bytes have reached
+	// the file, so a killed process can never leave an index entry pointing
+	// at data that was never written.
+	pend map[uint32]datapointer
 	cmp  []byte // scratch buffer for dedup verification
 	foff int64  // logical end of file, including buffered but unflushed bytes
 	open bool
@@ -145,6 +150,7 @@ func NewTilemap(pth string, zoom int, ro bool) (w *Tilemap, err error) {
 		}
 		w.wtr = bufio.NewWriterSize(fio, writeBufferSize)
 		w.hmp = make(map[uint64]uint32, 1024)
+		w.pend = make(map[uint32]datapointer, 1024)
 	}
 	return w, nil
 }
@@ -191,6 +197,13 @@ func (w *Tilemap) Add(x, y int, buff []byte) (err error) {
 			return w.setDataPointer(tid, dp)
 		}
 	}
+	// flush ourselves rather than letting bufio do it mid write, so pending
+	// index entries are committed in step with the data and pend stays small
+	if w.wtr.Available() < len(buff) {
+		if err = w.flush(); err != nil {
+			return errorLine(err)
+		}
+	}
 	dp, err := w.writeNewBuffer(buff)
 	if err != nil {
 		return errorLine(err)
@@ -225,14 +238,40 @@ func (w *Tilemap) sameContents(dp datapointer, buff []byte) (bool, error) {
 // flushFor makes sure the bytes referenced by dp are on disk rather than
 // sitting in the append buffer.  The caller must hold the write lock.
 func (w *Tilemap) flushFor(dp datapointer) error {
-	if w.wtr == nil || w.wtr.Buffered() == 0 {
+	if w.isFlushed(dp) {
 		return nil
 	}
-	flushed := w.foff - int64(w.wtr.Buffered())
-	if dp.offset+dp.size <= flushed {
-		return nil
+	return w.flush()
+}
+
+// isFlushed reports whether the bytes referenced by dp have been handed to
+// the file.  The caller must hold the write lock.
+func (w *Tilemap) isFlushed(dp datapointer) bool {
+	if w.wtr == nil {
+		return true
 	}
-	return w.wtr.Flush()
+	return dp.offset+dp.size <= w.foff-int64(w.wtr.Buffered())
+}
+
+// flush writes out the append buffer and then commits the pending index
+// entries.  The caller must hold the write lock.
+func (w *Tilemap) flush() error {
+	if err := w.wtr.Flush(); err != nil {
+		return err
+	}
+	return w.commitPending()
+}
+
+// commitPending writes the pending index entries into the mapped index.  The
+// caller must hold the write lock and must have flushed the append buffer.
+func (w *Tilemap) commitPending() error {
+	for tid, dp := range w.pend {
+		if err := w.encodeDataPointer(tid, dp); err != nil {
+			return err
+		}
+		delete(w.pend, tid)
+	}
+	return nil
 }
 
 func (w *Tilemap) writeNewBuffer(buff []byte) (dp datapointer, err error) {
@@ -250,6 +289,9 @@ func (w *Tilemap) writeNewBuffer(buff []byte) (dp datapointer, err error) {
 }
 
 func (w *Tilemap) getDataPointer(tid uint32) (dp datapointer, err error) {
+	if pdp, ok := w.pend[tid]; ok {
+		return pdp, nil
+	}
 	toff := int64(tid) * dpsize
 	if toff+dpsize > int64(len(w.mm)) {
 		err = fmt.Errorf("%w %d: %d > %d", ErrInvalidTileID, tid, toff+dpsize, len(w.mm))
@@ -259,7 +301,20 @@ func (w *Tilemap) getDataPointer(tid uint32) (dp datapointer, err error) {
 	return
 }
 
+// setDataPointer points tid at dp.  If the bytes for dp are still buffered
+// the entry is held in pend until they are flushed.  The caller must hold the
+// write lock.
 func (w *Tilemap) setDataPointer(tid uint32, dp datapointer) (err error) {
+	if !w.isFlushed(dp) {
+		w.pend[tid] = dp
+		return nil
+	}
+	// the new entry supersedes any older one still waiting on a flush
+	delete(w.pend, tid)
+	return w.encodeDataPointer(tid, dp)
+}
+
+func (w *Tilemap) encodeDataPointer(tid uint32, dp datapointer) (err error) {
 	toff := int64(tid) * dpsize
 	if toff+dpsize > int64(len(w.mm)) {
 		err = fmt.Errorf("%w %d: %d > %d", ErrInvalidTileID, tid, toff+dpsize, len(w.mm))
@@ -345,11 +400,13 @@ func (w *Tilemap) Flush() error {
 	if !w.open {
 		return ErrClosed
 	}
-	return w.wtr.Flush()
+	return w.flush()
 }
 
 // Sync flushes buffered tile data and forces both the index and the data to
-// stable storage.
+// stable storage.  The data is synced before the new index entries are
+// written so the index can never reach the disk ahead of the tiles it
+// references.
 func (w *Tilemap) Sync() error {
 	if w.ro {
 		return nil
@@ -361,10 +418,14 @@ func (w *Tilemap) Sync() error {
 	}
 	if err := w.wtr.Flush(); err != nil {
 		return errorLine(err)
+	} else if err = w.fio.Sync(); err != nil {
+		return errorLine(err)
+	} else if err = w.commitPending(); err != nil {
+		return errorLine(err)
 	} else if err = w.mm.Sync(gommap.MS_SYNC); err != nil {
 		return errorLine(err)
 	}
-	return w.fio.Sync()
+	return nil
 }
 
 // Close flushes outstanding writes and releases the file and mappings.
@@ -376,14 +437,15 @@ func (w *Tilemap) Close() (err error) {
 		return nil
 	}
 	w.open = false
-	w.hmp = nil
-	w.cmp = nil
 	if w.wtr != nil {
-		if err = w.wtr.Flush(); err != nil {
+		if err = w.flush(); err != nil {
 			err = errorLine(err)
 		}
 		w.wtr = nil
 	}
+	w.hmp = nil
+	w.pend = nil
+	w.cmp = nil
 	if w.data != nil {
 		if lerr := w.data.UnsafeUnmap(); lerr != nil && err == nil {
 			err = errorLine(lerr)

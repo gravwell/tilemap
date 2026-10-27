@@ -1,6 +1,6 @@
 module github.com/gravwell/tilemap
 
-go 1.21
+go 1.27
 
 require (
 	github.com/dchest/siphash v1.2.3

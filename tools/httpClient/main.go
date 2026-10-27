@@ -43,6 +43,7 @@ var (
 	fOutput      = flag.String("output", "", "Output directory for <zoom>.tiles (required)")
 	fParallelism = flag.Int("parallelism", 8, "Number of concurrent requests")
 	fTimeout     = flag.Duration("timeout", 2*time.Minute, "Per request timeout")
+	fCheckTime   = flag.Duration("check-timeout", 30*time.Second, "Timeout for the startup request that checks the endpoint")
 	fRetries     = flag.Int("retries", 10, "Retries per tile on transient failures, 0 retries forever")
 	fResume      = flag.Bool("resume", true, "Skip tiles already present in an existing tilemap")
 	fAllowMiss   = flag.Bool("allow-missing", false, "Skip tiles the server answers 404 for instead of failing")
@@ -77,6 +78,8 @@ func main() {
 		fatalUsage("parallelism must be at least 1")
 	} else if *fRetries < 0 {
 		fatalUsage("retries must not be negative")
+	} else if *fCheckTime <= 0 {
+		fatalUsage("check-timeout must be positive")
 	}
 	tmpl, err := parseEndpoint(*fEndpoint, *fZoom)
 	if err != nil {
@@ -91,7 +94,7 @@ func main() {
 
 	ftch := newFetcher(tmpl, *fParallelism, *fTimeout, *fRetries, *fUserAgent, *fAllowMiss)
 	log.Printf("Checking %s\n", tmpl.url(0, 0))
-	if err = ftch.check(ctx); err != nil {
+	if err = ftch.check(ctx, *fCheckTime); err != nil {
 		log.Fatalf("Tile server check failed: %v\n", err)
 	}
 
@@ -147,7 +150,7 @@ func run(pctx context.Context, tm *tilemap.Tilemap, ftch *fetcher, dim, workers 
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			if err := worker(ctx, tm, ftch, coords, resume, st); err != nil {
@@ -254,7 +257,7 @@ func report(ctx context.Context, st *stats, total uint64) {
 	}
 }
 
-func fatalUsage(format string, args ...interface{}) {
+func fatalUsage(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n\n", args...)
 	flag.Usage()
 	os.Exit(2)

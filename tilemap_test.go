@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/dchest/siphash"
@@ -16,6 +17,7 @@ import (
 var (
 	tdir      string
 	basicBuff []byte
+	tpaths    = map[testing.TB]bool{}
 )
 
 func TestMain(m *testing.M) {
@@ -34,9 +36,16 @@ func TestMain(m *testing.M) {
 	os.Exit(r)
 }
 
-// tpath hands out a unique file for each test so zoom levels never collide
+// tpath hands out a unique file for each test so zoom levels never collide.
+// The file is removed on the first call in each test so -count > 1 starts
+// fresh.
 func tpath(t testing.TB) string {
-	return filepath.Join(tdir, t.Name()+`.tiles`)
+	p := filepath.Join(tdir, t.Name()+`.tiles`)
+	if !tpaths[t] {
+		tpaths[t] = true
+		os.Remove(p)
+	}
+	return p
 }
 
 func TestEncodeDecode(t *testing.T) {
@@ -77,8 +86,8 @@ func TestTileID(t *testing.T) {
 	for zoom := 1; zoom <= 4; zoom++ {
 		dim := 1 << zoom
 		seen := make(map[uint32]bool, dim*dim)
-		for x := 0; x < dim; x++ {
-			for y := 0; y < dim; y++ {
+		for x := range dim {
+			for y := range dim {
 				id := tileid(zoom, x, y)
 				if want := uint32(x*dim + y); id != want {
 					t.Fatalf("zoom %d %d/%d: %d != %d", zoom, x, y, id, want)
@@ -146,8 +155,8 @@ func TestTilemap(t *testing.T) {
 		t.Fatal(err)
 	}
 	dim := 1 << zl
-	for i := 0; i < dim; i++ {
-		for j := 0; j < dim; j++ {
+	for i := range dim {
+		for j := range dim {
 			if err = wtr.Add(i, j, randBuff(basicBuff)); err != nil {
 				t.Fatal(err)
 			}
@@ -188,8 +197,8 @@ func TestTilemapHighCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	buff := basicBuff[0 : 8*1024]
-	for i := 0; i < zl; i++ {
-		for j := 0; j < zl; j++ {
+	for i := range zl {
+		for j := range zl {
 			if err = wtr.Add(i, j, randBuff(buff)); err != nil {
 				t.Fatal(err)
 			}
@@ -207,8 +216,8 @@ func TestTilemapDedup(t *testing.T) {
 	}
 	tile := basicBuff[:4096]
 	base := wtr.Size()
-	for i := 0; i < 8; i++ {
-		for j := 0; j < 8; j++ {
+	for i := range 8 {
+		for j := range 8 {
 			if err = wtr.Add(i, j, tile); err != nil {
 				t.Fatal(err)
 			}
@@ -262,8 +271,8 @@ func TestTilemapReadWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	dim := 1 << zl
-	for i := 0; i < dim; i++ {
-		for j := 0; j < dim; j++ {
+	for i := range dim {
+		for j := range dim {
 			buff := randBuff(basicBuff)
 			key := siphash.Hash(sipkey1, sipkey2, buff)
 			if err = wtr.Add(i, j, buff); err != nil {
@@ -274,8 +283,8 @@ func TestTilemapReadWrite(t *testing.T) {
 	}
 
 	// reads on a writer must see tiles that are still sitting in the buffer
-	for i := 0; i < dim; i++ {
-		for j := 0; j < dim; j++ {
+	for i := range dim {
+		for j := range dim {
 			if ok, err := wtr.Has(i, j); err != nil || !ok {
 				t.Fatalf("Has %d/%d: %v %v", i, j, ok, err)
 			}
@@ -308,7 +317,7 @@ func TestTilemapReadWriteReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < dim/2; i++ {
-		for j := 0; j < dim; j++ {
+		for j := range dim {
 			buff := randBuff(basicBuff)
 			key := siphash.Hash(sipkey1, sipkey2, buff)
 			if err = wtr.Add(i, j, buff); err != nil {
@@ -324,8 +333,8 @@ func TestTilemapReadWriteReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	// resume support, the first half must be visible after reopen
-	for i := 0; i < dim; i++ {
-		for j := 0; j < dim; j++ {
+	for i := range dim {
+		for j := range dim {
 			if ok, err := wtr.Has(i, j); err != nil {
 				t.Fatal(err)
 			} else if ok != (i < dim/2) {
@@ -334,7 +343,7 @@ func TestTilemapReadWriteReopen(t *testing.T) {
 		}
 	}
 	for i := dim / 2; i < dim; i++ {
-		for j := 0; j < dim; j++ {
+		for j := range dim {
 			buff := randBuff(basicBuff)
 			key := siphash.Hash(sipkey1, sipkey2, buff)
 			if err = wtr.Add(i, j, buff); err != nil {
@@ -351,8 +360,8 @@ func TestTilemapReadWriteReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < dim; i++ {
-		for j := 0; j < dim; j++ {
+	for i := range dim {
+		for j := range dim {
 			if buff, err := rdr.GetTile(i, j); err != nil {
 				t.Fatal(err)
 			} else {
@@ -399,6 +408,182 @@ func TestTilemapReadOnlyMissing(t *testing.T) {
 	}
 }
 
+// TestTilemapUnflushedIndex simulates a writer that is killed before it can
+// flush.  Another handle on the same file sees exactly what the disk would
+// hold after the kill, and must never find an index entry that points at
+// bytes that were never written.
+func TestTilemapUnflushedIndex(t *testing.T) {
+	zl := 6
+	dim := 1 << zl
+	wtr, err := NewTilemap(tpath(t), zl, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wtr.Close()
+
+	// a handful of small tiles stays entirely in the append buffer
+	if err = wtr.Add(0, 0, basicBuff[:100]); err != nil {
+		t.Fatal(err)
+	} else if err = wtr.Add(0, 2, basicBuff[100:300]); err != nil {
+		t.Fatal(err)
+	}
+	checkDiskIndex(t, zl, 0)
+
+	// verifying a duplicate reads the original back from the file, which
+	// flushes and commits both buffered tiles along with the alias
+	if err = wtr.Add(0, 1, basicBuff[:100]); err != nil {
+		t.Fatal(err)
+	}
+	checkDiskIndex(t, zl, 3)
+
+	// fill well past the buffer so it flushes on its own several times, the
+	// tail of the run is still buffered when we look
+	var added int
+	for i := 1; i < dim; i++ {
+		for j := range dim {
+			if err = wtr.Add(i, j, randBuff(basicBuff)); err != nil {
+				t.Fatal(err)
+			}
+			added++
+		}
+	}
+	if found := checkDiskIndex(t, zl, -1); found == 0 || found >= added {
+		t.Fatalf("expected a partial flush, found %d of %d tiles", found, added)
+	}
+
+	// an explicit flush makes everything visible
+	if err = wtr.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	checkDiskIndex(t, zl, 3+added)
+}
+
+// checkDiskIndex opens a second handle on the test file and makes sure every
+// index entry is readable.  It returns the number of tiles present, and fails
+// if want is not negative and does not match.
+func checkDiskIndex(t *testing.T, zl, want int) (found int) {
+	t.Helper()
+	rdr, err := NewTilemap(tpath(t), zl, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Close()
+	dim := 1 << zl
+	for i := range dim {
+		for j := range dim {
+			if _, err := rdr.GetTile(i, j); err == nil {
+				found++
+			} else if !errors.Is(err, ErrTileNotFound) {
+				t.Fatalf("tile %d/%d: %v", i, j, err)
+			}
+		}
+	}
+	if want >= 0 && found != want {
+		t.Fatalf("found %d tiles on disk, expected %d", found, want)
+	}
+	return
+}
+
+// TestTilemapConcurrent hammers a single read/write handle from several
+// writers and readers at once.  It is only meaningful under go test -race.
+func TestTilemapConcurrent(t *testing.T) {
+	zl := 5
+	dim := 1 << zl
+	wtr, err := NewTilemap(tpath(t), zl, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const writers = 4
+	const readers = 4
+
+	var wg sync.WaitGroup
+	errs := make(chan error, writers+readers+1)
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// each writer owns a band of columns, and every other tile is
+			// a duplicate so the dedup path is exercised too
+			for i := w; i < dim; i += writers {
+				for j := range dim {
+					buff := randBuff(basicBuff)
+					if j%2 == 1 {
+						buff = basicBuff[:512]
+					}
+					if err := wtr.Add(i, j, buff); err != nil {
+						errs <- err
+						return
+					}
+				}
+				if err := wtr.Flush(); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(w)
+	}
+	stop := make(chan struct{})
+	var rwg sync.WaitGroup
+	for r := range readers {
+		rwg.Add(1)
+		go func(r int) {
+			defer rwg.Done()
+			for n := r; ; n++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				x, y := n%dim, (n/dim)%dim
+				ok, err := wtr.Has(x, y)
+				if err != nil {
+					errs <- err
+					return
+				} else if !ok {
+					continue
+				}
+				buff, err := wtr.GetTile(x, y)
+				if err != nil {
+					errs <- err
+					return
+				} else if y%2 == 1 && !bytes.Equal(buff, basicBuff[:512]) {
+					errs <- fmt.Errorf("bad duplicate tile at %d/%d", x, y)
+					return
+				}
+				_ = wtr.Size()
+			}
+		}(r)
+	}
+	wg.Wait()
+	if err = wtr.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	rwg.Wait()
+
+	// Close racing with readers must be clean, they see ErrClosed or a tile
+	rwg.Go(func() {
+		for i := 0; i < dim*dim; i++ {
+			if _, err := wtr.GetTile(i%dim, i/dim); err != nil && !errors.Is(err, ErrClosed) {
+				errs <- err
+				return
+			}
+		}
+	})
+	if err = wtr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rwg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if err = wtr.Add(0, 0, basicBuff[:10]); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed after close, got %v", err)
+	}
+	checkDiskIndex(t, zl, dim*dim)
+}
+
 func BenchmarkAddUnique(b *testing.B) {
 	wtr, err := NewTilemap(tpath(b), 12, false)
 	if err != nil {
@@ -439,8 +624,8 @@ func BenchmarkGetTile(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	for i := 0; i < 64; i++ {
-		for j := 0; j < 64; j++ {
+	for i := range 64 {
+		for j := range 64 {
 			if err = wtr.Add(i, j, randBuff(basicBuff)); err != nil {
 				b.Fatal(err)
 			}

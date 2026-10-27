@@ -37,13 +37,16 @@ file and serve tiles straight out of the page cache.
 
 ## Tools
 
+The tools live in their own module under `tools/` so the library does not
+pull in their dependencies.  Build them from that directory.
+
 ### httpClient
 
 Builds the tilemap for one zoom level by requesting every tile from a tile
 server.
 
 ```
-go build ./tools/httpClient
+cd tools && go build ./httpClient
 ./httpClient -endpoint http://tiles.example.com/tile/{z}/{x}/{y}.png -zoom 8 -output /data/tiles -parallelism 16
 ```
 
@@ -54,14 +57,17 @@ go build ./tools/httpClient
 | `-output` | | directory that receives `<zoom>.tiles` |
 | `-parallelism` | 8 | concurrent requests |
 | `-timeout` | 2m | per request timeout |
+| `-check-timeout` | 30s | timeout for the startup request that checks the endpoint, raise it for slow on-demand renderers |
 | `-retries` | 10 | retries per tile on network errors, 5xx, 429 and 408 (0 retries forever) |
 | `-resume` | true | skip tiles already present in an existing `<zoom>.tiles` |
 | `-allow-missing` | false | treat 404 as an empty tile instead of failing |
 | `-user-agent` | gravwell-tilemap/1.0 | User-Agent header |
 
 Tiles are requested in 8x8 blocks so rendering backends that produce metatiles
-serve most of a block from cache.  An interrupted run leaves a consistent
-tilemap; re-running with the same arguments picks up where it left off.
+serve most of a block from cache.  An interrupted run, including one killed
+with `kill -9`, leaves a consistent tilemap: tiles still in the write buffer
+are lost but never referenced by the index.  Re-running with the same
+arguments picks up where it left off.
 
 ### webserver
 
@@ -79,4 +85,5 @@ Imports tiles from a tar archive laid out as `<zoom>/<x>/<y>.png`.
 
 ### mapnik
 
-Renders tiles directly with mapnik.  Requires cgo and the mapnik C API.
+Renders tiles directly with mapnik.  Requires cgo and the mapnik C API; run
+`configure.bash` in the `github.com/fawick/go-mapnik/mapnik` package first.
