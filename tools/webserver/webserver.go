@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/gravwell/tilemap"
 )
 
@@ -22,6 +22,8 @@ const (
 
 var (
 	ErrBadRequest = errors.New("bad request")
+
+	errNoMatch = errors.New("path is not a tile request")
 )
 
 type Webserver struct {
@@ -30,6 +32,7 @@ type Webserver struct {
 	sync.WaitGroup
 	lst  net.Listener
 	tm   []*tilemap.Tilemap
+	fbh  http.Handler // handles requests that are not tile requests
 	accW io.WriteCloser
 	lgrW io.WriteCloser
 	lgr  *log.Logger
@@ -55,10 +58,13 @@ func NewWebserver(c Config, maps []*tilemap.Tilemap) (w *Webserver, err error) {
 		return
 	}
 	w.lgr = log.New(w.lgrW, ``, log.LUTC|log.Lshortfile|log.LstdFlags)
-	rtr := mux.NewRouter()
-	rtr.HandleFunc(`/tiles/{zoom:\d+}/{x:\d+}/{y:\d+}.png`, w.tileHandler).Methods(`GET`)
+	rtr := http.NewServeMux()
+	rtr.HandleFunc(`GET /tiles/{zoom}/{x}/{y}`, w.tileHandler)
 	if c.FileDir != `` {
-		rtr.NotFoundHandler = fhandler{http.FileServer(http.Dir(filepath.Clean(c.FileDir)))}
+		w.fbh = http.FileServer(http.Dir(filepath.Clean(c.FileDir)))
+		rtr.Handle(`/`, w.fbh)
+	} else {
+		w.fbh = http.NotFoundHandler()
 	}
 	w.Server.Handler = loggingHandler(w.accW, rtr)
 	w.Server.ErrorLog = w.lgr
@@ -68,7 +74,11 @@ func NewWebserver(c Config, maps []*tilemap.Tilemap) (w *Webserver, err error) {
 
 func (ws *Webserver) tileHandler(w http.ResponseWriter, r *http.Request) {
 	zoom, x, y, err := getTileVars(r)
-	if err != nil {
+	if errors.Is(err, errNoMatch) {
+		// the stdlib mux can't express the numeric/.png constraints, so hand
+		// anything that doesn't look like a tile off to the fallback handler
+		ws.fbh.ServeHTTP(w, r)
+	} else if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 	} else if zoom < 0 || zoom >= len(ws.tm) || ws.tm[zoom] == nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -92,34 +102,36 @@ func getTileVars(r *http.Request) (zoom, x, y int, err error) {
 		err = ErrBadRequest
 		return
 	}
-	mp := mux.Vars(r)
-	if mp == nil {
-		err = ErrBadRequest
+	zs, xs := r.PathValue(`zoom`), r.PathValue(`x`)
+	ys, ok := strings.CutSuffix(r.PathValue(`y`), `.png`)
+	if !ok || !isDigits(zs) || !isDigits(xs) || !isDigits(ys) {
+		err = errNoMatch
 		return
 	}
-	if st, ok := mp[`zoom`]; !ok {
-		err = ErrBadRequest
+	if zoom, err = strconv.Atoi(zs); err != nil {
 		return
-	} else if zoom, err = strconv.Atoi(st); err != nil {
+	} else if x, err = strconv.Atoi(xs); err != nil {
 		return
-	}
-
-	if st, ok := mp[`x`]; !ok {
-		err = ErrBadRequest
-		return
-	} else if x, err = strconv.Atoi(st); err != nil {
+	} else if y, err = strconv.Atoi(ys); err != nil {
 		return
 	}
-	if st, ok := mp[`y`]; !ok {
-		err = ErrBadRequest
-		return
-	} else if y, err = strconv.Atoi(st); err != nil {
-		return
-	}
-	if zoom < 0 || zoom > maxZoom || x < 0 || y < 0 {
+	if zoom > maxZoom {
 		err = ErrBadRequest
 	}
 	return
+}
+
+// isDigits reports whether s is a non-empty string of ASCII digits
+func isDigits(s string) bool {
+	if s == `` {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Webserver) Start() (err error) {
@@ -146,14 +158,6 @@ func (w *Webserver) Close() (err error) {
 	w.accW.Close()
 	w.lgrW.Close()
 	return
-}
-
-type fhandler struct {
-	h http.Handler
-}
-
-func (h fhandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.h.ServeHTTP(w, r)
 }
 
 type logHandler struct {

@@ -82,8 +82,3 @@ Imports tiles from a tar archive laid out as `<zoom>/<x>/<y>.png`.
 ```
 ./tarImport -max-zoom 15 tiles.tar /data/tiles
 ```
-
-### mapnik
-
-Renders tiles directly with mapnik.  Requires cgo and the mapnik C API; run
-`configure.bash` in the `github.com/fawick/go-mapnik/mapnik` package first.
