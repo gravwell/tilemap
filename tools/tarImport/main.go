@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"errors"
 	"flag"
@@ -13,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gravwell/ingesters/utils"
 	"github.com/gravwell/tilemap"
 )
 
@@ -46,15 +46,15 @@ func main() {
 		log.Fatalf("%s is not a directory\n", baseDir)
 	}
 
-	rdr, err := utils.OpenBufferedFileReader(args[0], 1024*1024)
+	fin, err := os.Open(args[0])
 	if err != nil {
 		log.Fatalf("Failed to open %s: %v\n", args[0], err)
 	}
-	if err := tarRunner(rdr, tmm); err != nil {
+	if err := tarRunner(bufio.NewReaderSize(fin, 1024*1024), tmm); err != nil {
 		log.Fatalf("Failed to run: %v\n", err)
 	}
 
-	if err := rdr.Close(); err != nil {
+	if err := fin.Close(); err != nil {
 		log.Fatalf("Failed to close reader: %v\n", err)
 	}
 	for _, v := range tmm {
@@ -72,7 +72,7 @@ func tarRunner(r io.Reader, tmm []*tilemap.Tilemap) (err error) {
 	var hdr *tar.Header
 	var zoom, x, y int
 	var added uint
-	bb := bytes.NewBuffer(make([]byte, maxFileSize))
+	bb := bytes.NewBuffer(make([]byte, 0, maxFileSize))
 	for {
 		if hdr, err = tr.Next(); err != nil {
 			if err == io.EOF {
@@ -96,7 +96,9 @@ func tarRunner(r io.Reader, tmm []*tilemap.Tilemap) (err error) {
 			}
 		}
 		bb.Reset()
-		io.Copy(bb, tr)
+		if _, err = io.Copy(bb, tr); err != nil {
+			return
+		}
 		if err = tmm[zoom].Add(x, y, bb.Bytes()); err != nil {
 			return
 		}
@@ -123,14 +125,14 @@ func processFilename(pth string) (zoom, x, y int, err error) {
 
 	if x, err = strconv.Atoi(bits[1]); err != nil {
 		return
-	} else if x > (1 << zoom) {
-		err = fmt.Errorf("invalid x value: %d > %d", x, 1<<zoom)
+	} else if x < 0 || x >= (1<<zoom) {
+		err = fmt.Errorf("invalid x value: %d >= %d", x, 1<<zoom)
 		return
 	}
 	if y, err = strconv.Atoi(bits[2]); err != nil {
 		return
-	} else if y > (1 << zoom) {
-		err = fmt.Errorf("invalid y value: %d > %d", y, 1<<zoom)
+	} else if y < 0 || y >= (1<<zoom) {
+		err = fmt.Errorf("invalid y value: %d >= %d", y, 1<<zoom)
 		return
 	}
 	return

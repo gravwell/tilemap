@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
-	"github.com/gravwell/ingesters/utils"
 	"github.com/gravwell/tilemap"
 )
 
@@ -37,7 +38,7 @@ func main() {
 		log.Fatalf("Failed to start webserver: %v\n", err)
 	}
 
-	utils.WaitForQuit() //wait for one of our shutdown signals
+	waitForQuit() //wait for one of our shutdown signals
 
 	if err := ws.Close(); err != nil {
 		log.Fatalf("Failed to close webserver")
@@ -46,6 +47,14 @@ func main() {
 	if err := closeTilemaps(tmm); err != nil {
 		log.Fatalf("Failed to close tilemaps: %v\n", err)
 	}
+}
+
+// waitForQuit blocks until SIGINT, SIGTERM or SIGQUIT is received
+func waitForQuit() {
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	<-sc
+	signal.Stop(sc)
 }
 
 func closeTilemaps(tmm []*tilemap.Tilemap) (err error) {
