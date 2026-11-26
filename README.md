@@ -29,6 +29,10 @@ err = tm.Close()
 tm, err := tilemap.NewTilemap("/data/tiles/8.tiles", 8, true)
 buff, err := tm.GetTile(x, y) // tilemap.ErrTileNotFound for a tile that was never added
 ok, err := tm.Has(x, y)
+
+// check an existing file before resuming it
+info, err := tilemap.ScanIndex("/data/tiles/8.tiles", 8) // tilemap.ErrZoomMismatch on a mismatched file
+fmt.Println(info.Present, info.Tiles, info.Complete())
 ```
 
 Writers buffer appends and flush on `Flush`, `Sync`, `Close`, or whenever a
@@ -64,10 +68,30 @@ cd tools && go build ./httpClient
 | `-user-agent` | gravwell-tilemap/1.0 | User-Agent header |
 
 Tiles are requested in 8x8 blocks so rendering backends that produce metatiles
-serve most of a block from cache.  An interrupted run, including one killed
-with `kill -9`, leaves a consistent tilemap: tiles still in the write buffer
-are lost but never referenced by the index.  Re-running with the same
-arguments picks up where it left off.
+serve most of a block from cache.
+
+Runs can be stopped and restarted.  Re-running with the same arguments picks
+up where the last run left off:
+
+1. An existing `<zoom>.tiles` is scanned with `tilemap.ScanIndex` before it is
+   opened for writing.  The file must be laid out for the requested zoom (see
+   below), otherwise the run stops without touching it.
+2. Every tile already in the index is skipped, only missing tiles are
+   requested.  A map that is already complete exits without contacting the
+   server.
+
+An interrupted run, including one killed with `kill -9`, leaves a consistent
+tilemap.  Buffered tiles are flushed every 10 seconds, so a hard kill loses at
+most the last few seconds of work; tiles that never reached the file are
+never referenced by the index.  Tiles skipped with `-allow-missing` are not
+stored, so they are requested again on every resume.
+
+The file format does not record its zoom level, so `ScanIndex` checks the
+structure instead: the file must be at least as large as the zoom level's
+index, every index entry must be empty or point inside the data region, and
+the lowest referenced tile must sit right after the index, where the first
+tile added is always written.  A file built for a different zoom fails one
+of these checks.
 
 ### webserver
 

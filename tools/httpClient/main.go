@@ -7,8 +7,12 @@
 //
 // The endpoint may contain {z}, {x} and {y} placeholders.  If it has none the
 // conventional "/{z}/{x}/{y}.png" suffix is appended.  Output is written to
-// <output>/<zoom>.tiles, the layout the webserver tool expects.  Re-running
-// against an existing tilemap resumes, skipping tiles that are already stored.
+// <output>/<zoom>.tiles, the layout the webserver tool expects.
+//
+// Runs can be stopped and restarted.  An existing tilemap is scanned before
+// anything is fetched: its index must match the requested zoom level, and
+// every tile it already holds is skipped, so only the missing tiles are
+// requested.
 package main
 
 import (
@@ -16,6 +20,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
@@ -35,6 +40,11 @@ const (
 	metatileDim = 8
 
 	progressInterval = 5 * time.Second
+
+	// flushInterval bounds how much work a hard kill can lose.  Fetched
+	// tiles sit in the tilemap's write buffer until it fills, which for
+	// small tiles from a slow renderer can be many minutes of requests.
+	flushInterval = 10 * time.Second
 )
 
 var (
@@ -89,6 +99,24 @@ func main() {
 		log.Fatalf("Failed to create output directory: %v\n", err)
 	}
 
+	dim := 1 << uint(*fZoom)
+	total := uint64(dim) * uint64(dim)
+	fname := filepath.Join(*fOutput, fmt.Sprintf("%d.tiles", *fZoom))
+
+	// validate any existing tilemap before it is opened for writing, a
+	// mismatched file would be grown and have its contents treated as index.
+	// This runs before the interrupt handler so a long scan can be killed.
+	present, err := existingTiles(fname, *fZoom)
+	if err != nil {
+		log.Fatalf("Cannot resume: %v\n", err)
+	}
+	if !*fResume {
+		present = 0 // fetch everything again
+	} else if present == total {
+		log.Printf("%s already holds all %d tiles, nothing to do\n", fname, total)
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -98,17 +126,16 @@ func main() {
 		log.Fatalf("Tile server check failed: %v\n", err)
 	}
 
-	fname := filepath.Join(*fOutput, fmt.Sprintf("%d.tiles", *fZoom))
 	tm, err := tilemap.NewTilemap(fname, *fZoom, false)
 	if err != nil {
 		log.Fatalf("Failed to open tilemap %s: %v\n", fname, err)
 	}
 
-	dim := 1 << uint(*fZoom)
-	total := uint64(dim) * uint64(dim)
-	log.Printf("Fetching zoom %d (%d tiles) into %s with %d workers\n", *fZoom, total, fname, *fParallelism)
+	log.Printf("Fetching zoom %d (%d of %d tiles remaining) into %s with %d workers\n",
+		*fZoom, total-present, total, fname, *fParallelism)
 
 	var st stats
+	st.skipped.Store(present) // counted up front so the rate only reflects real work
 	startSize := tm.Size()
 	start := time.Now()
 	err = run(ctx, tm, ftch, dim, *fParallelism, *fResume, &st)
@@ -141,19 +168,44 @@ func main() {
 	}
 }
 
-// run drives the workers and returns the first fatal error.
+// existingTiles validates the tilemap at fname, if there is one, and returns
+// how many tiles it already holds.  A missing or empty file holds none.
+func existingTiles(fname string, zoom int) (uint64, error) {
+	fi, err := os.Stat(fname)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	} else if !fi.Mode().IsRegular() {
+		return 0, fmt.Errorf("%s is not a regular file", fname)
+	} else if fi.Size() == 0 {
+		return 0, nil
+	}
+	log.Printf("Scanning existing tilemap %s (%s)\n", fname, humanBytes(uint64(fi.Size())))
+	start := time.Now()
+	info, err := tilemap.ScanIndex(fname, zoom)
+	if err != nil {
+		return 0, fmt.Errorf("%s is not a valid zoom %d tilemap, move it aside to start over: %w", fname, zoom, err)
+	}
+	log.Printf("Found %d/%d tiles (%.1f%%) in %v\n", info.Present, info.Tiles,
+		100*float64(info.Present)/float64(info.Tiles), time.Since(start).Round(time.Millisecond))
+	return info.Present, nil
+}
+
+// run drives the workers and returns the first fatal error.  When resume is
+// set, tiles already in tm are skipped and never handed to a worker.
 func run(pctx context.Context, tm *tilemap.Tilemap, ftch *fetcher, dim, workers int, resume bool, st *stats) error {
 	ctx, cancel := context.WithCancel(pctx)
 	defer cancel()
 
 	coords := make(chan coord, workers*4)
-	errCh := make(chan error, workers)
+	errCh := make(chan error, workers+1)
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for range workers {
 		go func() {
 			defer wg.Done()
-			if err := worker(ctx, tm, ftch, coords, resume, st); err != nil {
+			if err := worker(ctx, tm, ftch, coords, st); err != nil {
 				// a cancellation is a side effect of someone else's
 				// failure (or an interrupt), only report real errors
 				if !errors.Is(err, context.Canceled) {
@@ -164,59 +216,71 @@ func run(pctx context.Context, tm *tilemap.Tilemap, ftch *fetcher, dim, workers 
 		}()
 	}
 
-	// progress reporter
+	// progress reporter and periodic flusher
 	total := uint64(dim) * uint64(dim)
-	progressDone := make(chan struct{})
+	bgDone := make(chan struct{}, 2)
 	go func() {
-		defer close(progressDone)
 		report(ctx, st, total)
+		bgDone <- struct{}{}
+	}()
+	go func() {
+		if err := flusher(ctx, tm); err != nil {
+			errCh <- err
+			cancel()
+		}
+		bgDone <- struct{}{}
 	}()
 
-	feed(ctx, dim, coords)
+	ferr := feed(ctx, tm, dim, resume, coords)
 	close(coords)
 	wg.Wait()
 	cancel()
-	<-progressDone
+	<-bgDone
+	<-bgDone
 
 	select {
 	case err := <-errCh:
 		return err
 	default:
 	}
+	if ferr != nil && !errors.Is(ferr, context.Canceled) {
+		return ferr
+	}
 	return pctx.Err() // nil unless we were interrupted
 }
 
-// feed emits every coordinate in the zoom level, walking metatile blocks so
-// neighbouring tiles are requested together.
-func feed(ctx context.Context, dim int, out chan<- coord) {
+// feed emits every coordinate in the zoom level that still needs fetching,
+// walking metatile blocks so neighbouring tiles are requested together.
+// With resume set, tiles already present in tm are skipped.
+func feed(ctx context.Context, tm *tilemap.Tilemap, dim int, resume bool, out chan<- coord) error {
 	for bx := 0; bx < dim; bx += metatileDim {
 		for by := 0; by < dim; by += metatileDim {
 			for x := bx; x < bx+metatileDim && x < dim; x++ {
 				for y := by; y < by+metatileDim && y < dim; y++ {
+					if resume {
+						if ok, err := tm.Has(x, y); err != nil {
+							return fmt.Errorf("tile %d/%d: %w", x, y, err)
+						} else if ok {
+							continue
+						}
+					}
 					select {
 					case out <- coord{x: x, y: y}:
 					case <-ctx.Done():
-						return
+						return ctx.Err()
 					}
 				}
 			}
 		}
 	}
+	return nil
 }
 
-func worker(ctx context.Context, tm *tilemap.Tilemap, ftch *fetcher, in <-chan coord, resume bool, st *stats) error {
+func worker(ctx context.Context, tm *tilemap.Tilemap, ftch *fetcher, in <-chan coord, st *stats) error {
 	buf := ftch.newBuffer()
 	for c := range in {
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-		if resume {
-			if ok, err := tm.Has(c.x, c.y); err != nil {
-				return err
-			} else if ok {
-				st.skipped.Add(1)
-				continue
-			}
 		}
 		buff, err := ftch.get(ctx, buf, c.x, c.y, st)
 		if err != nil {
@@ -232,6 +296,23 @@ func worker(ctx context.Context, tm *tilemap.Tilemap, ftch *fetcher, in <-chan c
 		st.fetched.Add(1)
 	}
 	return nil
+}
+
+// flusher periodically pushes buffered tiles into the file so they survive
+// the process being killed.
+func flusher(ctx context.Context, tm *tilemap.Tilemap) error {
+	tckr := time.NewTicker(flushInterval)
+	defer tckr.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tckr.C:
+			if err := tm.Flush(); err != nil {
+				return fmt.Errorf("flushing tilemap: %w", err)
+			}
+		}
+	}
 }
 
 func report(ctx context.Context, st *stats, total uint64) {
