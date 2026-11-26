@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestMain(m *testing.M) {
 // The file is removed on the first call in each test so -count > 1 starts
 // fresh.
 func tpath(t testing.TB) string {
-	p := filepath.Join(tdir, t.Name()+`.tiles`)
+	p := filepath.Join(tdir, strings.ReplaceAll(t.Name(), "/", "_")+`.tiles`)
 	if !tpaths[t] {
 		tpaths[t] = true
 		os.Remove(p)
@@ -447,8 +448,8 @@ func TestTilemapUnflushedIndex(t *testing.T) {
 			added++
 		}
 	}
-	if found := checkDiskIndex(t, zl, -1); found == 0 || found >= added {
-		t.Fatalf("expected a partial flush, found %d of %d tiles", found, added)
+	if found := checkDiskIndex(t, zl, -1); found <= 3 || found >= 3+added {
+		t.Fatalf("expected a partial flush, found %d of %d tiles", found, 3+added)
 	}
 
 	// an explicit flush makes everything visible
@@ -658,4 +659,148 @@ func randBuff(b []byte) []byte {
 	}
 	off := rand.Intn(len(b) - l)
 	return b[off : off+l]
+}
+
+// buildPartial writes the first cols columns of a zoom zl tilemap at pth,
+// with every other tile shared to exercise dedup, and returns how many tiles
+// were stored.
+func buildPartial(t *testing.T, pth string, zl, cols int) uint64 {
+	t.Helper()
+	tm, err := NewTilemap(pth, zl, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n uint64
+	for x := range cols {
+		for y := range 1 << zl {
+			buff := basicBuff[:200]
+			if y%2 == 1 {
+				buff = randBuff(basicBuff)
+			}
+			if err = tm.Add(x, y, buff); err != nil {
+				t.Fatal(err)
+			}
+			n++
+		}
+	}
+	if err = tm.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestScanIndex(t *testing.T) {
+	zl := 5
+	pth := tpath(t)
+
+	// a freshly created, empty tilemap
+	tm, err := NewTilemap(pth, zl, false)
+	if err != nil {
+		t.Fatal(err)
+	} else if err = tm.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := ScanIndex(pth, zl); err != nil {
+		t.Fatal(err)
+	} else if info.Present != 0 || info.Tiles != 1<<(2*zl) || info.DataSize != 0 || info.Complete() {
+		t.Fatalf("bad empty info: %+v", info)
+	}
+
+	// part of a zoom level, then the rest after a reopen
+	want := buildPartial(t, pth, zl, 3)
+	info, err := ScanIndex(pth, zl)
+	if err != nil {
+		t.Fatal(err)
+	} else if info.Present != want || info.Complete() || info.DataSize <= 0 {
+		t.Fatalf("bad partial info, want %d present: %+v", want, info)
+	}
+	if tm, err = NewTilemap(pth, zl, false); err != nil {
+		t.Fatal(err)
+	}
+	for x := range 1 << zl {
+		for y := range 1 << zl {
+			if ok, err := tm.Has(x, y); err != nil {
+				t.Fatal(err)
+			} else if !ok {
+				if err = tm.Add(x, y, randBuff(basicBuff)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	if err = tm.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err = ScanIndex(pth, zl); err != nil {
+		t.Fatal(err)
+	} else if !info.Complete() {
+		t.Fatalf("expected a complete map: %+v", info)
+	}
+}
+
+// TestScanIndexZoomMismatch builds a zoom 5 tilemap in various states and
+// scans it as other zoom levels, every one of which must be rejected without
+// touching the file.
+func TestScanIndexZoomMismatch(t *testing.T) {
+	zl := 5
+	for _, tc := range []struct {
+		name string
+		cols int // columns of the zoom zl map to fill
+		scan int // zoom to scan it as
+	}{
+		{"empty-as-larger", 0, zl + 1},  // file smaller than the index
+		{"empty-as-smaller", 0, zl - 1}, // zeros past the index nothing references
+		{"partial-as-larger", 2, zl + 1},
+		{"partial-as-smaller", 2, zl - 1},
+		{"partial-as-much-smaller", 2, 1},
+		{"full-as-larger", 1 << zl, zl + 1},
+		{"full-as-smaller", 1 << zl, zl - 1},
+		{"full-as-much-larger", 1 << zl, zl + 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pth := tpath(t)
+			buildPartial(t, pth, zl, tc.cols)
+			before, err := os.Stat(pth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = ScanIndex(pth, tc.scan); !errors.Is(err, ErrZoomMismatch) && !errors.Is(err, ErrInvalidDatapointer) {
+				t.Fatalf("expected a mismatch scanning as zoom %d, got %v", tc.scan, err)
+			}
+			if after, err := os.Stat(pth); err != nil {
+				t.Fatal(err)
+			} else if after.Size() != before.Size() {
+				t.Fatalf("scan changed the file size %d -> %d", before.Size(), after.Size())
+			}
+			if info, err := ScanIndex(pth, zl); err != nil {
+				t.Fatalf("scan at the right zoom failed: %v", err)
+			} else if info.Present != uint64(tc.cols)<<zl {
+				t.Fatalf("expected %d tiles, got %+v", tc.cols<<zl, info)
+			}
+		})
+	}
+}
+
+func TestScanIndexCorrupt(t *testing.T) {
+	zl := 4
+	pth := tpath(t)
+	buildPartial(t, pth, zl, 2)
+	fio, err := os.OpenFile(pth, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// point tile 0/3 past the end of the file
+	var b [dpsize]byte
+	dp := datapointer{offset: 1 << 40, size: 100}
+	dp.Encode(b[:])
+	if _, err = fio.WriteAt(b[:], int64(tileid(zl, 0, 3))*dpsize); err != nil {
+		t.Fatal(err)
+	}
+	fio.Close()
+	if _, err = ScanIndex(pth, zl); !errors.Is(err, ErrInvalidDatapointer) {
+		t.Fatalf("expected ErrInvalidDatapointer, got %v", err)
+	}
+	if _, err = ScanIndex(filepath.Join(tdir, "nope.tiles"), zl); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected ErrNotExist, got %v", err)
+	}
 }

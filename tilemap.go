@@ -60,7 +60,22 @@ var (
 	ErrClosed              = errors.New("tilemap is closed")
 	ErrTileNotFound        = errors.New("tile not found")
 	ErrInvalidPath         = errors.New("invalid path")
+	ErrZoomMismatch        = errors.New("tilemap does not match zoom level")
 )
+
+// IndexInfo summarizes the contents of a tilemap, as reported by ScanIndex.
+type IndexInfo struct {
+	Zoom     int
+	Tiles    uint64 // slots in the index, 4^zoom
+	Present  uint64 // tiles that have been stored
+	FileSize int64  // total file size in bytes
+	DataSize int64  // bytes in the data region following the index
+}
+
+// Complete reports whether every tile in the zoom level has been stored.
+func (ii IndexInfo) Complete() bool {
+	return ii.Present == ii.Tiles
+}
 
 // Tilemap is a single zoom level tile store.  It is safe for concurrent use.
 type Tilemap struct {
@@ -357,6 +372,87 @@ func (w *Tilemap) Has(x, y int) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// ScanIndex opens the existing tilemap at pth read only, checks that its
+// layout matches zoom, and counts the tiles that have been stored.  Use it
+// before reopening a file for writing to resume building it: opening a
+// mismatched file for writing would grow it and treat its contents as index.
+//
+// The file format does not record its zoom level, so the check is
+// structural.  The file must be at least as large as the zoom level's index,
+// every index entry must be empty or reference bytes inside the data region,
+// and the lowest referenced tile must sit at the very start of the data
+// region, where the first tile added to a tilemap is always written.  A file
+// holding data that no index entry references fails the check as well.
+// Structural failures wrap ErrZoomMismatch, a bad index entry wraps
+// ErrInvalidDatapointer.
+func ScanIndex(pth string, zoom int) (info IndexInfo, err error) {
+	tm, err := NewTilemap(pth, zoom, true)
+	if err != nil {
+		if errors.Is(err, ErrInvalidDPRegionSize) {
+			err = fmt.Errorf("%w %d: file is smaller than a zoom %d index", ErrZoomMismatch, zoom, zoom)
+		}
+		return info, err
+	}
+	info, err = tm.scanIndex()
+	if cerr := tm.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	return info, err
+}
+
+// scanIndex walks every committed index entry.  Entries still pending in a
+// writer are not seen, so it is only meaningful on a read only handle or a
+// writer that has been flushed.
+func (w *Tilemap) scanIndex() (info IndexInfo, err error) {
+	w.mtx.RLock()
+	defer w.mtx.RUnlock()
+	if !w.open {
+		return info, ErrClosed
+	}
+	start := int64(len(w.mm)) // the data region begins right after the index
+	info = IndexInfo{
+		Zoom:     w.zoom,
+		Tiles:    uint64(tileCount(w.zoom)),
+		FileSize: w.foff,
+		DataSize: w.foff - start,
+	}
+	minOff := int64(-1)
+	var dp datapointer
+	for off := int64(0); off+dpsize <= start; off += dpsize {
+		if err = dp.Decode(w.mm[off : off+dpsize]); err != nil {
+			return info, err
+		}
+		if dp.size == 0 {
+			if dp.offset != 0 {
+				return info, w.badEntry(off, dp, start)
+			}
+			continue
+		} else if dp.size > MaxTileSize || dp.offset < start || dp.offset+dp.size > w.foff {
+			return info, w.badEntry(off, dp, start)
+		}
+		info.Present++
+		if minOff < 0 || dp.offset < minOff {
+			minOff = dp.offset
+		}
+	}
+	switch {
+	case info.Present > 0 && minOff != start:
+		return info, fmt.Errorf("%w %d: first referenced tile is at offset %#x, expected %#x right after the index",
+			ErrZoomMismatch, w.zoom, minOff, start)
+	case info.Present == 0 && info.DataSize > 0:
+		return info, fmt.Errorf("%w %d: file holds %d bytes past the index but no tiles reference them",
+			ErrZoomMismatch, w.zoom, info.DataSize)
+	}
+	return info, nil
+}
+
+func (w *Tilemap) badEntry(off int64, dp datapointer, start int64) error {
+	tid := off / dpsize
+	x, y := tid>>uint(w.zoom), tid&int64(w.dim-1)
+	return fmt.Errorf("%w: tile %d/%d references %#x:%#x, outside the zoom %d data region %#x:%#x",
+		ErrInvalidDatapointer, x, y, dp.offset, dp.offset+dp.size, w.zoom, start, w.foff)
 }
 
 // GetTile returns a copy of the tile stored at x, y.  ErrTileNotFound is
